@@ -1,175 +1,351 @@
 import numpy as np
 import pandas as pd
 import os
+import json
 import xgboost as xgb
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+import joblib
 import ta
+import schedule
+import time
+import pymongo
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import backtrader as bt
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 import warnings
+
 warnings.filterwarnings("ignore")
 
-# Configuration
-data_dir = "./data"
-model_dir = "./models"
-TIMEFRAMES = ['1m', '5m', '10m', '15m']
-PAST_BARS = 5  # Use last 5 candles as input features
+# Load environment variables
+load_dotenv()
 
-# Ensure model directory exists
+# Enhanced Configuration
+model_dir = "./models"
+TIMEFRAMES = ['1m']
+PAST_BARS = 20
+PREDICTION_THRESHOLD = 0.001
+VALIDATION_WINDOWS = 5
+FEATURE_NAMES_FILE = os.path.join(model_dir, "feature_names.json")
+SCALER_FILE = os.path.join(model_dir, "scaler.pkl")
+
 os.makedirs(model_dir, exist_ok=True)
 
+# MongoDB setup
+client = pymongo.MongoClient(os.getenv("DATABASE_URL"))
+db = client['skyZero']
+
+class FeatureCalculator:
+    """Centralized feature calculation for consistency"""
+    def __init__(self, timeframe):
+        self.timeframe = timeframe
+        self.prefix = f'{timeframe}_'
+        
+    def calculate_technical_indicators(self, df):
+        """Consistent technical indicator calculation"""
+        indicators = pd.DataFrame(index=df.index)
+        
+        # Price Action
+        indicators[f'{self.prefix}HL_Ratio'] = df['high'] / df['low']
+        indicators[f'{self.prefix}CO_Ratio'] = df['close'] / df['open']
+        indicators[f'{self.prefix}True_Range'] = ta.volatility.AverageTrueRange(df.high, df.low, df.close).average_true_range()
+
+        
+        # Momentum
+        indicators[f'{self.prefix}RSI'] = ta.momentum.RSIIndicator(df.close).rsi()
+        indicators[f'{self.prefix}Stoch_RSI'] = ta.momentum.StochRSIIndicator(df.close).stochrsi()
+        
+        # Volume
+        if 'volume' in df.columns:
+            indicators[f'{self.prefix}OBV'] = ta.volume.OnBalanceVolumeIndicator(
+                df.close, df.volume).on_balance_volume()
+        
+        # Trend
+        for window in [5, 8, 13]:
+            indicators[f'{self.prefix}EMA_{window}'] = ta.trend.EMAIndicator(
+                df.close, window=window).ema_indicator()
+        
+        # Volatility
+        bb = ta.volatility.BollingerBands(df.close)
+        indicators[f'{self.prefix}BB_Width'] = (
+            bb.bollinger_hband() - bb.bollinger_lband()) / df.close
+        
+        return indicators.dropna()
+
+    def create_advanced_features(self, df):
+        """Consistent advanced feature creation"""
+        features = pd.DataFrame(index=df.index)
+        
+        # Price changes
+        for i in range(1, PAST_BARS):
+            features[f'return_lag_{i}'] = df['close'].pct_change(i)
+        
+        # Momentum
+        for window in [3, 5, 8]:
+            features[f'momentum_{window}'] = df['close'].diff(window)
+        
+        # Statistical features
+        features['rolling_mean'] = df['close'].rolling(PAST_BARS).mean()
+        features['rolling_std'] = df['close'].rolling(PAST_BARS).std()
+        
+        return features.dropna()
+
 def load_data(timeframe):
-    """Load data for a specific timeframe"""
-    file_path = os.path.join(data_dir, f'NIFTY_BANK_{timeframe}.csv')
+    """Improved data loading with outlier handling"""
+    collection = db[f'NIFTY_BANK_{timeframe}']
+    data = list(collection.find({}, {'_id': 0, 'oneMCandles': 1})
+                .sort("timestamp", -1).limit(5000))
     
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"CSV file not found: {file_path}")
+    if not data:
+        raise ValueError(f"No data found for {timeframe}")
     
-    df = pd.read_csv(file_path, parse_dates=['timestamp'], index_col='timestamp')
-    df = df[['open', 'high', 'low', 'close']].sort_index()
+    candles = data[0].get('oneMCandles', [])
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
     
-    if df.empty:
-        raise ValueError(f"CSV file {file_path} is empty")
-
-    return df
-
-def calculate_technical_indicators(df, timeframe):
-    """Calculate technical indicators for a given timeframe"""
-    prefix = f'{timeframe}_'
-    indicators = pd.DataFrame(index=df.index)
-
-    # CPR Levels
-    indicators[f'{prefix}CPR_Pivot'] = (df.high + df.low + df.close) / 3
-    indicators[f'{prefix}CPR_BC'] = (df.high + df.low) / 2
-    indicators[f'{prefix}CPR_TC'] = 2 * indicators[f'{prefix}CPR_Pivot'] - indicators[f'{prefix}CPR_BC']
-
-    # Bollinger Bands
-    bb = ta.volatility.BollingerBands(df.close, window=20)
-    indicators[f'{prefix}BB_High'] = bb.bollinger_hband()
-    indicators[f'{prefix}BB_Low'] = bb.bollinger_lband()
-
-    # ATR (Volatility Indicator)
-    indicators[f'{prefix}ATR'] = ta.volatility.AverageTrueRange(df.high, df.low, df.close).average_true_range()
-
-    # RSI & MACD
-    indicators[f'{prefix}RSI'] = ta.momentum.RSIIndicator(df.close).rsi()
-    macd = ta.trend.MACD(df.close)
-    indicators[f'{prefix}MACD'] = macd.macd()
-    indicators[f'{prefix}MACD_Signal'] = macd.macd_signal()
-
-    # Moving Averages
-    for window in [5, 20, 50]:
-        indicators[f'{prefix}MA_{window}'] = df.close.rolling(window).mean()
-
-    # Difference Between MAs (Momentum Feature)
-    indicators[f'{prefix}MA_Diff_5_20'] = indicators[f'{prefix}MA_5'] - indicators[f'{prefix}MA_20']
-
-    # Time-Based Features
-    indicators['hour'] = df.index.hour
-    indicators['minute'] = df.index.minute
-
-    return indicators.dropna()
-
-def create_lag_features(df, past_bars):
-    """Add previous bars' close prices as features"""
-    for i in range(1, past_bars + 1):
-        df[f'close_lag_{i}'] = df['close'].shift(i)
-    return df.dropna()
+    # Improved outlier detection
+    outlier_flags = pd.Series(False, index=df.index)
+    for col in ['open', 'high', 'low', 'close']:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        outlier_flags |= (df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR))
+    
+    return df[~outlier_flags].sort_index()
 
 def preprocess_data(df, timeframe):
-    """Prepare data for XGBoost training"""
-    # Calculate indicators
-    indicators = calculate_technical_indicators(df, timeframe)
-    df = df.merge(indicators, left_index=True, right_index=True, how='left')
-
-    # Add lag features
-    df = create_lag_features(df, PAST_BARS)
-
-    # Drop NaN values
-    df.dropna(inplace=True)
-
-    # Select features (excluding raw prices)
-    features = [col for col in df.columns if col not in ['open', 'high', 'low', 'close']]
-    if not features:
-        raise ValueError(f"No features available for training {timeframe}")
-
-    # Target is next period's close price
-    target = df['close'].shift(-1)
+    """Full preprocessing pipeline with feature persistence"""
+    calculator = FeatureCalculator(timeframe)
     
-    # Align features and target
-    df_features = df[features].ffill().dropna()
-    target = target.loc[df_features.index]
+    # Calculate features
+    indicators = calculator.calculate_technical_indicators(df)
+    advanced_features = calculator.create_advanced_features(df)
+    
+    # Merge features
+    df = df.join(indicators).join(advanced_features).dropna()
+    
+    # Create target
+    target = df['close'].pct_change().shift(-1).dropna()
+    df = df.loc[target.index]
+    
+    # Select features
+    features = [col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume']]
+    
+    # Save feature names
+    with open(FEATURE_NAMES_FILE, 'w') as f:
+        json.dump(features, f)
+    
+    # Scale features
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(df[features])
+    joblib.dump(scaler, SCALER_FILE)
+    
+    return X_scaled, target.values, scaler, features, df.index
 
-    # Remove rows with missing targets
-    valid_indices = target.notna()
-    X = df_features[valid_indices]
-    y = target[valid_indices]
+def optimize_model(X_train, y_train):
+    """Hyperparameter optimization"""
+    param_grid = {
+        'n_estimators': [500, 1000],
+        'max_depth': [4, 6],
+        'learning_rate': [0.01, 0.03],
+        'subsample': [0.8, 0.9],
+    }
+    
+    model = xgb.XGBRegressor(objective='reg:squarederror', tree_method='hist')
+    tscv = TimeSeriesSplit(n_splits=VALIDATION_WINDOWS)
+    
+    grid = GridSearchCV(model, param_grid, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid.fit(X_train, y_train)
+    
+    return grid.best_estimator_
 
-    # Normalize features
-    scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    return X_scaled, y.values, scaler, X.columns.tolist(), df.index[valid_indices]
-
-def train_and_save_model(X_train, y_train, X_test, y_test, timeframe):
-    """Train and save an XGBoost model for a specific timeframe"""
+def train_model(timeframe):
+    """Complete training pipeline"""
     model_path = os.path.join(model_dir, f"xgboost_{timeframe}.model")
-
+    
+    # Load data
+    df = load_data(timeframe)
+    X, y, scaler, features, _ = preprocess_data(df, timeframe)
+    
+    # Train/test split
+    split = int(len(X) * 0.8)
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+    
+    # Train or load model
     if os.path.exists(model_path):
         model = xgb.XGBRegressor()
         model.load_model(model_path)
-        print(f"\nLoaded existing model for {timeframe}")
     else:
-        print(f"\nTraining new model for {timeframe}...")
-        model = xgb.XGBRegressor(
-            objective='reg:squarederror',
-            n_estimators=1200,  # Increased estimators
-            learning_rate=0.005,  # Lower learning rate
-            max_depth=8,  # Increased depth for better learning
-            subsample=0.9,
-            colsample_bytree=0.9,
-            early_stopping_rounds=50
-        )
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=10
-        )
+        model = optimize_model(X_train, y_train)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50)
         model.save_model(model_path)
-
+    
+    # Validate
+    validate_model(model, X_test, y_test)
     return model
 
-def forecast_next_period(model, X_last, scaler, feature_names):
-    """Forecast the next period's close price"""
-    X_last_scaled = scaler.transform([X_last])
-    y_pred = model.predict(X_last_scaled)
-    return y_pred[0]
+def validate_model(model, X_test, y_test):
+    """Comprehensive model validation"""
+    preds = model.predict(X_test)
+    
+    print(f"\nValidation Metrics:")
+    print(f"RMSE: {np.sqrt(mean_squared_error(y_test, preds)):.6f}")
+    print(f"MAE: {mean_absolute_error(y_test, preds):.6f}")
+    print(f"R²: {r2_score(y_test, preds):.2f}")
+    print(f"Direction Accuracy: {np.mean(np.sign(preds) == np.sign(y_test)):.2%}")
+
+class TradingStrategy(bt.Strategy):
+    """Consistent Backtrader strategy"""
+    params = (
+        ('risk_pct', 1),
+        ('stop_loss', 0.5),
+        ('take_profit', 1),
+    )
+    
+    def __init__(self):
+        self.model = xgb.XGBRegressor()
+        self.model.load_model(os.path.join(model_dir, "xgboost_1m.model"))
+        self.scaler = joblib.load(SCALER_FILE)
+        with open(FEATURE_NAMES_FILE, 'r') as f:
+            self.feature_names = json.load(f)
+        
+        self.calculator = FeatureCalculator('1m')
+        self.order = None
+
+    def next(self):
+        if len(self.data) < PAST_BARS:
+            return
+        
+        try:
+            # Prepare features
+            df = pd.DataFrame({
+                'open': self.data.open.get(size=PAST_BARS),
+                'high': self.data.high.get(size=PAST_BARS),
+                'low': self.data.low.get(size=PAST_BARS),
+                'close': self.data.close.get(size=PAST_BARS),
+                'volume': self.data.volume.get(size=PAST_BARS)
+            })
+            
+            indicators = self.calculator.calculate_technical_indicators(df)
+            advanced = self.calculator.create_advanced_features(df)
+            features = pd.concat([indicators, advanced], axis=1)[self.feature_names].tail(1)
+            
+            # Predict
+            scaled = self.scaler.transform(features)
+            pred = self.model.predict(scaled)[0]
+            
+            # Execute strategy
+            self.execute_trades(pred)
+            
+        except Exception as e:
+            print(f"Prediction error: {str(e)}")
+
+    def execute_trades(self, prediction):
+        """Risk-managed trade execution"""
+        if self.order:
+            return
+            
+        if prediction > PREDICTION_THRESHOLD:
+            self.buy_signal()
+        elif prediction < -PREDICTION_THRESHOLD:
+            self.sell_signal()
+
+    def buy_signal(self):
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+        size = (cash * self.params.risk_pct/100) / price
+        self.order = self.buy(size=size)
+        self.stop_price = price * (1 - self.params.stop_loss/100)
+        self.target_price = price * (1 + self.params.take_profit/100)
+
+    def sell_signal(self):
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+        size = (cash * self.params.risk_pct/100) / price
+        self.order = self.sell(size=size)
+        self.stop_price = price * (1 + self.params.stop_loss/100)
+        self.target_price = price * (1 - self.params.take_profit/100)
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                print(f"BUY EXECUTED @ {order.executed.price:.2f}")
+            else:
+                print(f"SELL EXECUTED @ {order.executed.price:.2f}")
+
+def run_backtest(timeframe):
+    """Complete backtest execution"""
+    cerebro = bt.Cerebro()
+    
+    # Add data
+    data = load_data_for_backtrader(timeframe)
+    cerebro.adddata(data)
+    
+    # Add strategy
+    cerebro.addstrategy(TradingStrategy)
+    
+    # Configure broker
+    cerebro.broker.setcash(100000)
+    cerebro.broker.setcommission(commission=0.001)
+    
+    # Add analyzers
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    
+    print("Starting Backtest...")
+    results = cerebro.run()
+    
+    # Show results
+    strat = results[0]
+    print(f"Final Portfolio Value: {cerebro.broker.getvalue():.2f}")
+    print(f"Sharpe Ratio: {strat.analyzers.sharpe.get_analysis()['sharperatio']:.2f}")
+    print(f"Max Drawdown: {strat.analyzers.drawdown.get_analysis()['max']['drawdown']:.2f}%")
+
+def load_data_for_backtrader(timeframe):
+    """Prepare Backtrader-compatible data feed"""
+    df = load_data(timeframe)
+    df['datetime'] = df.index
+    df = df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
+    return bt.feeds.PandasData(dataname=df, datetime='datetime')
+
+def schedule_jobs():
+    """Job scheduling"""
+    schedule.every(1).minutes.do(lambda: train_model('1m'))
+    schedule.every(1).minutes.do(lambda: run_backtest('1m'))
+    schedule.every().day.at("00:00").do(cleanup_old_results)
+
+def cleanup_old_results():
+    """Database maintenance"""
+    for timeframe in TIMEFRAMES:
+        db[f'forecasts_{timeframe}'].delete_many({
+            'timestamp': {'$lt': datetime.now() - timedelta(days=7)}
+        })
 
 def main():
-    predictions = {}
-
+    """Main execution"""
+    # Validate feature consistency
     for timeframe in TIMEFRAMES:
-        print(f"\nProcessing {timeframe} timeframe...")
-
         df = load_data(timeframe)
-        X, y, scaler, feature_names, timestamps = preprocess_data(df, timeframe)
-
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, shuffle=False
-        )
-
-        # Train and save model
-        model = train_and_save_model(X_train, y_train, X_test, y_test, timeframe)
-
-        # Forecast next period
-        X_last = X[-1]
-        forecast_price = forecast_next_period(model, X_last, scaler, feature_names)
-
-        predictions[timeframe] = forecast_price
-        print(f"\nForecasted next close price for {timeframe}: {forecast_price:.2f}")
-
-    print("\nFinal Forecasts:", predictions)
+        X, _, _, features, _ = preprocess_data(df, timeframe)
+        
+        if os.path.exists(FEATURE_NAMES_FILE):
+            with open(FEATURE_NAMES_FILE) as f:
+                saved_features = json.load(f)
+                if features != saved_features:
+                    raise ValueError("Feature mismatch detected! Retrain models.")
+    
+    # Initial training and backtest
+    for timeframe in TIMEFRAMES:
+        train_model(timeframe)
+        run_backtest(timeframe)
+    
+    # Start scheduled jobs
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
