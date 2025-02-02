@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Install other dependencies you might need
 RUN pip install --upgrade pip
-RUN pip install pandas numpy matplotlib scikit-learn
+RUN pip install pandas numpy matplotlib scikit-learn xgboost ta
 
 # Copy your local code into the container's working directory
 COPY . /app
