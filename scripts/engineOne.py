@@ -20,8 +20,12 @@ from scipy.signal import hilbert
 from imblearn.over_sampling import SMOTE
 import warnings
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import seaborn as sns
 import yfinance as yf
+
+# Global variable to store predictions for live plotting
+live_predictions = []  # Each entry is a dict with keys: timestamp, actual_close, forecast_close
 
 # CSV file for logging predictions
 CSV_FILE = "real_time_forecast_log.csv"
@@ -91,7 +95,7 @@ def load_data():
     """Load historical data from Yahoo Finance for training"""
     symbol = "^NSEBANK"
     interval = "1m"
-    period = "60d"  # 60 days of historical data
+    period = "8d"  # 60 days of historical data
     
     df = yf.download(tickers=symbol, interval=interval, period=period)
     df.reset_index(inplace=True)
@@ -190,7 +194,52 @@ def real_time_forecast():
     else:
         df_log.to_csv(CSV_FILE, index=False, mode='a', header=False)
 
+    # Append the new prediction to the global list for live plotting
+    live_predictions.append({
+        "timestamp": last_timestamp,
+        "actual_close": last_close,
+        "forecast_close": next_close
+    })
+
+    # Update the live plot
+    update_live_plot()
+
     return predicted_direction, prob, next_close
+
+def update_live_plot():
+    """Update a live Matplotlib plot of actual market close vs. forecast close prices."""
+    if not live_predictions:
+        return
+
+    # Convert list of dictionaries to a DataFrame
+    df_plot = pd.DataFrame(live_predictions)
+    
+    # Create or update the plot
+    plt.figure("Live Forecast vs Actual", figsize=(10, 6))
+    plt.clf()  # Clear the figure to update the plot
+    
+    # Plot actual close prices
+    plt.plot(df_plot['timestamp'], df_plot['actual_close'], label="Actual Close", marker="o")
+    # Plot forecast close prices
+    plt.plot(df_plot['timestamp'], df_plot['forecast_close'], label="Forecast Close", marker="x")
+    
+    # Format the x-axis to show time properly
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.gcf().autofmt_xdate()  # Rotate date labels
+    
+    plt.xlabel("Timestamp")
+    plt.ylabel("Price")
+    plt.title("Live Actual vs. Forecast Close Prices")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    
+    # Draw the updated plot
+    plt.pause(0.01)  # Short pause to allow the plot to refresh
+
+# Before starting the scheduler, enable interactive mode for Matplotlib:
+plt.ion()
+
 
 def preprocess_data(df):
     """Feature engineering pipeline"""
@@ -290,6 +339,26 @@ def validate_model(model, X_test, y_test):
     print("\nTop 10 Features:")
     for feat, score in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]:
         print(f"{feat}: {score}")
+
+    # Feature importance visualization
+    plt.figure(figsize=(10, 6))
+    feat_importances = pd.Series(importance)
+    feat_importances.nlargest(10).sort_values().plot(kind='barh')
+    plt.title('Top 10 Feature Importances')
+    plt.xlabel('Importance Score')
+    plt.tight_layout()
+    plt.show()
+
+        # Confusion matrix heatmap
+    cm = confusion_matrix(y_test, preds)
+    plt.figure(figsize=(6, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    plt.show()
+
 
 class ForecastStrategy(bt.Strategy):
     """Optimized trading strategy with price forecasting"""
@@ -409,24 +478,77 @@ class ForecastStrategy(bt.Strategy):
             
             mae = mean_absolute_error(df_forecast['actual_next_close'], 
                                       df_forecast['predicted_close'])
+            rmse = np.sqrt(mean_squared_error(df_forecast['actual_next_close'], 
+                                            df_forecast['predicted_close']))
+            r2 = r2_score(df_forecast['actual_next_close'], df_forecast['predicted_close'])                          
             print(f"\nMean Absolute Error: {mae:.4f}")
+            print(f"RMSE: {rmse:.4f}")
+            print(f"R-squared: {r2:.4f}")
             
             # Sample predictions
             print("\nSample Forecasts:")
             print(df_forecast[['timestamp', 'current_close', 'predicted_prob', 
                              'predicted_close', 'actual_next_close']].tail(5))
             
-            # Visualization
-            plt.figure(figsize=(12, 6))
+            # Visualization 1: Price and Predictions
+            plt.figure(figsize=(15, 10))
+            
+            # Price Plot
+            plt.subplot(3, 1, 1)
             plt.plot(df_forecast['timestamp'], df_forecast['current_close'], label='Current Close')
             plt.plot(df_forecast['timestamp'], df_forecast['predicted_close'], 
                      label='Predicted Close', alpha=0.7)
             plt.plot(df_forecast['timestamp'], df_forecast['actual_next_close'], 
                      label='Actual Next Close', linestyle='--')
             plt.title('Price Forecast Performance')
-            plt.xlabel('Time')
-            plt.ylabel('Price')
             plt.legend()
+
+            # RSI Plot
+            plt.subplot(3, 1, 2)
+            calculator = EnhancedFeatureCalculator()
+            full_features = calculator.calculate_core_features(
+                self.data_df.set_index('timestamp').ffill()
+            )
+            full_features.reset_index(inplace=True)
+            merged = pd.merge(df_forecast, full_features, on='timestamp', how='left')
+            plt.plot(merged['timestamp'], merged['1m_RSI'], label='RSI')
+            plt.axhline(70, linestyle='--', color='r', alpha=0.5)
+            plt.axhline(30, linestyle='--', color='g', alpha=0.5)
+            plt.title('RSI Indicator')
+            plt.legend()
+
+            # Keltner Channel Plot
+            plt.subplot(3, 1, 3)
+            plt.plot(merged['timestamp'], merged['1m_Keltner_Width'], label='Keltner Width')
+            plt.title('Keltner Channel Width')
+            plt.legend()
+
+            plt.tight_layout()
+            plt.show()
+
+            # Visualization 2: Prediction Analysis
+            plt.figure(figsize=(15, 5))
+            
+            # Residuals Plot
+            plt.subplot(1, 2, 1)
+            residuals = df_forecast['actual_next_close'] - df_forecast['predicted_close']
+            plt.scatter(df_forecast['predicted_close'], residuals, alpha=0.5)
+            plt.axhline(0, color='r', linestyle='--')
+            plt.xlabel('Predicted Close')
+            plt.ylabel('Residuals')
+            plt.title('Prediction Residuals')
+
+            # Scatter Plot
+            plt.subplot(1, 2, 2)
+            plt.scatter(df_forecast['actual_next_close'], df_forecast['predicted_close'], alpha=0.5)
+            plt.plot([df_forecast['actual_next_close'].min(), df_forecast['actual_next_close'].max()],
+                     [df_forecast['actual_next_close'].min(), df_forecast['actual_next_close'].max()], 
+                     'r--')
+            plt.xlabel('Actual Close')
+            plt.ylabel('Predicted Close')
+            plt.title('Actual vs Predicted Close')
+
+            plt.tight_layout()
             plt.show()
 
 def run_backtest():
@@ -477,7 +599,7 @@ def run_backtest():
 if __name__ == "__main__":
     # Optionally, train the model if not already trained.
     # Set use_csv=True and provide a valid csv file path to load data from CSV.
-    train_model(use_csv=False, csv_file_path="historical_data.csv")
+    train_model(use_csv=False, csv_file_path="./data/NIFTY_BANK_1m.csv")
     
     # Start real-time forecasting every minute (if desired)
     schedule.every(1).minutes.do(real_time_forecast)
