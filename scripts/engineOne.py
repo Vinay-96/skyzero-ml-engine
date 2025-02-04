@@ -101,6 +101,22 @@ def load_data():
     df = df[["Open", "High", "Low", "Close", "Volume"]].rename(columns=str.lower)
     return df.ffill().dropna()
 
+def load_data_csv(csv_file_path):
+    """
+    Load historical data from a CSV file for training.
+    The CSV file should contain a 'timestamp' column that can be parsed into datetime,
+    and columns: open, high, low, close, volume.
+    """
+    if not os.path.exists(csv_file_path):
+        raise FileNotFoundError(f"CSV file '{csv_file_path}' not found.")
+    
+    df = pd.read_csv(csv_file_path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index("timestamp", inplace=True)
+    # Ensure column names are lowercase
+    df.columns = [col.lower() for col in df.columns]
+    return df.ffill().dropna()
+
 def load_live_data(symbol="^NSEBANK", interval="1m", period="1d"):
     """Fetch real-time 1-minute price data from Yahoo Finance."""
     df = yf.download(tickers=symbol, interval=interval, period=period)
@@ -164,7 +180,7 @@ def real_time_forecast():
         "Last_Close": [last_close],
         "Predicted_Next_Close": [next_close],
         "Direction": ["UP" if predicted_direction else "DOWN"],
-        "Confidence": [prob]
+        "Confidence": [f"{prob * 100:.2f}%"]
     }
 
     df_log = pd.DataFrame(data)
@@ -218,8 +234,15 @@ def optimize_model(X_train, y_train):
     print(f"Best parameters: {grid.best_params_}")
     return grid.best_estimator_
 
-def train_model():
-    """Enhanced training pipeline with model reuse"""
+def train_model(use_csv=False, csv_file_path="historical_data.csv"):
+    """
+    Train the model using data loaded from yfinance (default) or from a CSV file.
+    
+    Parameters:
+        use_csv (bool): If True, load data from the CSV file specified by csv_file_path.
+                        Otherwise, data is loaded from yfinance.
+        csv_file_path (str): Path to the CSV file with historical data.
+    """
     model_path = os.path.join(model_dir, "xgboost_1m_one.model")
     
     if os.path.exists(model_path):
@@ -229,7 +252,10 @@ def train_model():
         return model
 
     print("Training new model...")
-    df = load_data()
+    if use_csv:
+        df = load_data_csv(csv_file_path)
+    else:
+        df = load_data()
     X, y, scaler, feature_cols, next_closes = preprocess_data(df)
 
     # Temporal split
@@ -449,8 +475,9 @@ def run_backtest():
     cerebro.plot(style='candlestick')
 
 if __name__ == "__main__":
-    # Optionally, train the model if not already trained
-    train_model()
+    # Optionally, train the model if not already trained.
+    # Set use_csv=True and provide a valid csv file path to load data from CSV.
+    train_model(use_csv=False, csv_file_path="historical_data.csv")
     
     # Start real-time forecasting every minute (if desired)
     schedule.every(1).minutes.do(real_time_forecast)

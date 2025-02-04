@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Install other dependencies you might need
 RUN pip install --upgrade pip
-RUN pip install pandas numpy matplotlib scikit-learn xgboost ta python-dotenv schedule backtrader
+RUN pip install pandas numpy matplotlib scikit-learn xgboost ta python-dotenv schedule backtrader imblearn pymongo seaborn
 
 # Copy your local code into the container's working directory
 COPY . /app
