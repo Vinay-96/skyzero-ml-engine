@@ -14,7 +14,7 @@ import backtrader as bt
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
                              f1_score, confusion_matrix, mean_absolute_error,
-                             classification_report)
+                             classification_report, mean_squared_error, r2_score)
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from scipy.signal import hilbert
 from imblearn.over_sampling import SMOTE
@@ -61,7 +61,7 @@ class EnhancedFeatureCalculator:
             features = pd.DataFrame(index=df.index)
         
             # Price transformation features
-            features[f'{self.prefix}log_return'] = np.log(df['close']/df['close'].shift(1))
+            features[f'{self.prefix}log_return'] = np.log(df['close'] / df['close'].shift(1))
             features[f'{self.prefix}cumulative_gain'] = df['close'].pct_change().rolling(5).sum()
             features[f'{self.prefix}volatility'] = df['close'].pct_change().rolling(PAST_BARS).std()
         
@@ -76,7 +76,7 @@ class EnhancedFeatureCalculator:
             # Advanced volatility
             keltner = ta.volatility.KeltnerChannel(df.high, df.low, df.close)
             features[f'{self.prefix}Keltner_Width'] = ((keltner.keltner_channel_hband() - 
-            keltner.keltner_channel_lband()) / df.close)
+                                                        keltner.keltner_channel_lband()) / df.close)
         
             # Lagged features
             for lag in [1, 3, 5, 8]:
@@ -95,7 +95,7 @@ def load_data():
     """Load historical data from Yahoo Finance for training"""
     symbol = "^NSEBANK"
     interval = "1m"
-    period = "8d"  # 60 days of historical data
+    period = "8d"  # 8 days of historical data
     
     df = yf.download(tickers=symbol, interval=interval, period=period)
     df.reset_index(inplace=True)
@@ -172,7 +172,19 @@ def real_time_forecast():
     last_low = df["low"].iloc[-1]
 
     # Calculate price change using range and confidence
-    price_change = (last_high - last_low) * prob * (1 if predicted_direction else -1)
+    # price_change = (last_high - last_low) * prob * (1 if predicted_direction else -1)
+    # next_close = last_close + price_change
+
+    # Calculate dynamic volatility
+    if (last_high - last_low) == 0:
+        # Fallback to percentage-based volatility
+        base_volatility = last_close * 0.0005  # 0.05%
+    else:
+        # Use actual range scaled by confidence
+        base_volatility = (last_high - last_low) * 0.5 # Reduce impact of full range
+
+    direction_multiplier = 1 if predicted_direction else -1
+    price_change = base_volatility * prob * direction_multiplier
     next_close = last_close + price_change
 
     print(f"{timestamp} | Predicted Direction: {'UP' if predicted_direction else 'DOWN'}, Confidence: {prob:.2%}")
@@ -201,12 +213,12 @@ def real_time_forecast():
         "forecast_close": next_close
     })
 
-    # Update the live plot
-    update_live_plot()
+    # Update the live plot (saves to the shared volume directory)
+    update_live_plot(output_file="/plots/live_plot.png")
 
     return predicted_direction, prob, next_close
 
-def update_live_plot():
+def update_live_plot(output_file="/plots/live_plot.png"):
     """Update a live Matplotlib plot of actual market close vs. forecast close prices."""
     if not live_predictions:
         return
@@ -214,9 +226,8 @@ def update_live_plot():
     # Convert list of dictionaries to a DataFrame
     df_plot = pd.DataFrame(live_predictions)
     
-    # Create or update the plot
+    # Create the plot
     plt.figure("Live Forecast vs Actual", figsize=(10, 6))
-    plt.clf()  # Clear the figure to update the plot
     
     # Plot actual close prices
     plt.plot(df_plot['timestamp'], df_plot['actual_close'], label="Actual Close", marker="o")
@@ -234,12 +245,9 @@ def update_live_plot():
     plt.grid(True)
     plt.tight_layout()
     
-    # Draw the updated plot
-    plt.pause(0.01)  # Short pause to allow the plot to refresh
-
-# Before starting the scheduler, enable interactive mode for Matplotlib:
-plt.ion()
-
+    # Save the plot to a file in the shared volume directory
+    plt.savefig(output_file)
+    plt.close()  # Close the figure to free up memory
 
 def preprocess_data(df):
     """Feature engineering pipeline"""
@@ -349,7 +357,7 @@ def validate_model(model, X_test, y_test):
     plt.tight_layout()
     plt.show()
 
-        # Confusion matrix heatmap
+    # Confusion matrix heatmap
     cm = confusion_matrix(y_test, preds)
     plt.figure(figsize=(6, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
@@ -358,7 +366,6 @@ def validate_model(model, X_test, y_test):
     plt.ylabel('Actual')
     plt.title('Confusion Matrix')
     plt.show()
-
 
 class ForecastStrategy(bt.Strategy):
     """Optimized trading strategy with price forecasting"""
@@ -479,7 +486,7 @@ class ForecastStrategy(bt.Strategy):
             mae = mean_absolute_error(df_forecast['actual_next_close'], 
                                       df_forecast['predicted_close'])
             rmse = np.sqrt(mean_squared_error(df_forecast['actual_next_close'], 
-                                            df_forecast['predicted_close']))
+                                              df_forecast['predicted_close']))
             r2 = r2_score(df_forecast['actual_next_close'], df_forecast['predicted_close'])                          
             print(f"\nMean Absolute Error: {mae:.4f}")
             print(f"RMSE: {rmse:.4f}")
@@ -601,11 +608,8 @@ if __name__ == "__main__":
     # Set use_csv=True and provide a valid csv file path to load data from CSV.
     train_model(use_csv=False, csv_file_path="./data/NIFTY_BANK_1m.csv")
     
-    # Start real-time forecasting every minute (if desired)
+    # Schedule the real-time forecasting job to run every minute.
     schedule.every(1).minutes.do(real_time_forecast)
-    
-    # You can run the backtest separately if needed:
-    # run_backtest()
     
     print("Starting scheduled real-time forecasting. Press Ctrl+C to exit.")
     try:
