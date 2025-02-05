@@ -1,6 +1,6 @@
 import yfinance as yf
 
-def fetch_and_save_data(ticker, period="max", filename="data.csv", interval="1d"):
+def fetch_and_save_data(ticker, period="2d", filename="data.csv", interval="1m"):
     """
     Fetch historical data for a given ticker from Yahoo Finance and save it as a CSV file.
 

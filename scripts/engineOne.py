@@ -656,10 +656,12 @@ if __name__ == "__main__":
     
     # Optionally, run temporal cross-validation separately.
     df = load_data()  # Or load_data_csv(...) if preferred.
+    # df = load_data_csv(csv_file_path)  
+
     cv_results = temporal_cross_val(df, model)
     print("Temporal Cross Validation Results:")
     print(cv_results)
-    run_backtest()
+    # run_backtest()
     # Schedule the real-time forecasting job to run every minute.
     schedule.every(1).minutes.do(real_time_forecast)
     
