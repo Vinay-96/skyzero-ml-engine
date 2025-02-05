@@ -1,1 +1,1 @@
-["1m_log_return", "1m_cumulative_gain", "1m_volatility", "1m_RSI", "1m_TSI", "1m_KAMA", "1m_Hilbert", "1m_Keltner_Width", "1m_lag_1", "1m_lag_3", "1m_lag_5", "1m_lag_8"]
+["1m_log_return", "1m_cumulative_gain", "1m_volatility", "1m_RSI", "1m_TSI", "1m_KAMA", "1m_Hilbert", "1m_Keltner_Width", "1m_lag_1", "1m_lag_3", "1m_lag_5", "1m_lag_8", "1m_Vortex", "1m_Residuals", "1m_Wavelet_1", "1m_Wavelet_2", "1m_Wavelet_3", "1m_Wavelet_4", "1m_Wavelet_5", "1m_OrderImbalance", "1m_VolCluster"]
