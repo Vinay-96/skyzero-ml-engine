@@ -5,3 +5,8 @@ docker run -it --rm -v D:\Sky⚡Zero\Sky⚡Zero-ML-Engine:/app tensorflow-dev ba
 docker build -t tensorflow-dev .
 
 docker run -it --rm -v /Users/vinay/Desktop/MLE-2/skyzero-ml-engine:/app tensorflow-dev bash
+
+docker run -it --rm \
+  -v /Users/vinay/Desktop/MLE-2/skyzero-ml-engine:/app \
+  -v /Users/vinay/Desktop/MLE-2/skyzero-ml-engine/plots:/plots \
+  tensorflow-dev bash
