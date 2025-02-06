@@ -14,14 +14,23 @@ import backtrader as bt
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
                              f1_score, confusion_matrix, mean_absolute_error,
-                             classification_report)
+                             classification_report, mean_squared_error, r2_score)
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from scipy.signal import hilbert
 from imblearn.over_sampling import SMOTE
 import warnings
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import seaborn as sns
 import yfinance as yf
+
+# Additional imports for the ensemble model
+from sklearn.ensemble import StackingClassifier
+from lightgbm import LGBMClassifier
+from sklearn.linear_model import LogisticRegression
+
+# Global variable to store predictions for live plotting
+live_predictions = []  # Each entry is a dict with keys: timestamp, actual_close, forecast_close
 
 # CSV file for logging predictions
 CSV_FILE = "real_time_forecast_log.csv"
@@ -40,10 +49,9 @@ SCALER_FILE = os.path.join(model_dir, "scaler.pkl")
 
 os.makedirs(model_dir, exist_ok=True)
 
-# MongoDB setup (optional)
-client = pymongo.MongoClient(os.getenv("DATABASE_URL", "mongodb+srv://BaseZero:dWajaoeQDj5sNvuD@skyzero.j95hi.mongodb.net/"))
-db = client['skyZero']
-
+# -------------------------------
+# 1. Enhanced Feature Engineering
+# -------------------------------
 class EnhancedFeatureCalculator:
     """Advanced feature engineering for price forecasting"""
     def __init__(self):
@@ -57,7 +65,7 @@ class EnhancedFeatureCalculator:
             features = pd.DataFrame(index=df.index)
         
             # Price transformation features
-            features[f'{self.prefix}log_return'] = np.log(df['close']/df['close'].shift(1))
+            features[f'{self.prefix}log_return'] = np.log(df['close'] / df['close'].shift(1))
             features[f'{self.prefix}cumulative_gain'] = df['close'].pct_change().rolling(5).sum()
             features[f'{self.prefix}volatility'] = df['close'].pct_change().rolling(PAST_BARS).std()
         
@@ -69,16 +77,37 @@ class EnhancedFeatureCalculator:
             # Cycle detection
             features[f'{self.prefix}Hilbert'] = np.unwrap(np.angle(hilbert(df.close)))
         
-            # Advanced volatility
+            # Advanced volatility: Keltner Channel
             keltner = ta.volatility.KeltnerChannel(df.high, df.low, df.close)
             features[f'{self.prefix}Keltner_Width'] = ((keltner.keltner_channel_hband() - 
-            keltner.keltner_channel_lband()) / df.close)
+                                                        keltner.keltner_channel_lband()) / df.close)
         
             # Lagged features
             for lag in [1, 3, 5, 8]:
                 features[f'{self.prefix}lag_{lag}'] = df['close'].shift(lag)
             
-            # Forecast target
+            # === New Enhanced Features ===
+            # Advanced Momentum
+            features[f'{self.prefix}Vortex'] = ta.trend.VortexIndicator(df.high, df.low, df.close).vortex_indicator_diff()
+            # features[f'{self.prefix}CMO'] = ta.momentum.ChaikinMoneyFlowIndicator(df.high, df.low, df.close, df.volume).chaikin_money_flow()
+            
+            # Machine Learning-Generated Features
+            features[f'{self.prefix}Residuals'] = df.close - df.close.rolling(20).mean()
+            # Compute a rolling FFT on the close price percentage change over a 20-bar window,
+            # then add the first 5 FFT components as separate features.
+            for i in range(5):
+                features[f'{self.prefix}Wavelet_{i+1}'] = (
+                    df.close.pct_change()
+                    .fillna(0)
+                    .rolling(window=20)
+                    .apply(lambda x: np.abs(np.fft.fft(x))[i], raw=False)
+                )
+            
+            # Market Microstructure Features
+            features[f'{self.prefix}OrderImbalance'] = (df.volume * (df.close - df.open)).rolling(5).sum()
+            features[f'{self.prefix}VolCluster'] = df['close'].pct_change().rolling(10).skew()
+            
+            # Forecast target (will be overwritten in preprocess_data)
             features['target'] = (df['close'].shift(-1) > df['close']).astype(int)
             features['next_close'] = df['close'].shift(-1)  # Store actual next close
             
@@ -87,11 +116,21 @@ class EnhancedFeatureCalculator:
             print(f"Feature calculation error: {str(e)}")
             return pd.DataFrame()
 
+# -------------------------------
+# Trend Strength Target Function
+# -------------------------------
+def calculate_target(series):
+    returns = series.pct_change(3).shift(-3)
+    return (returns > returns.quantile(0.6)).astype(int)  # Top 40% moves
+
+# -------------------------------
+# Data Loading Functions
+# -------------------------------
 def load_data():
     """Load historical data from Yahoo Finance for training"""
     symbol = "^NSEBANK"
     interval = "1m"
-    period = "60d"  # 60 days of historical data
+    period = "8d"  # 8 days of historical data
     
     df = yf.download(tickers=symbol, interval=interval, period=period)
     df.reset_index(inplace=True)
@@ -99,6 +138,22 @@ def load_data():
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.set_index("timestamp", inplace=True)
     df = df[["Open", "High", "Low", "Close", "Volume"]].rename(columns=str.lower)
+    return df.ffill().dropna()
+
+def load_data_csv(csv_file_path):
+    """
+    Load historical data from a CSV file for training.
+    The CSV file should contain a 'timestamp' column that can be parsed into datetime,
+    and columns: open, high, low, close, volume.
+    """
+    if not os.path.exists(csv_file_path):
+        raise FileNotFoundError(f"CSV file '{csv_file_path}' not found.")
+    
+    df = pd.read_csv(csv_file_path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index("timestamp", inplace=True)
+    # Ensure column names are lowercase
+    df.columns = [col.lower() for col in df.columns]
     return df.ffill().dropna()
 
 def load_live_data(symbol="^NSEBANK", interval="1m", period="1d"):
@@ -111,6 +166,157 @@ def load_live_data(symbol="^NSEBANK", interval="1m", period="1d"):
     df = df[["Open", "High", "Low", "Close", "Volume"]].rename(columns=str.lower)
     return df.ffill().dropna()
 
+# -------------------------------
+# Preprocessing Function
+# -------------------------------
+def preprocess_data(df):
+    """Feature engineering pipeline"""
+    calculator = EnhancedFeatureCalculator()
+    features = calculator.calculate_core_features(df)
+    
+    # Overwrite the 'target' column with the trend strength target
+    features['target'] = calculate_target(df.close)
+    
+    # Save feature names (exclude target and next_close)
+    feature_cols = [col for col in features.columns if col not in ['target', 'next_close']]
+    with open(FEATURE_NAMES_FILE, 'w') as f:
+        json.dump(feature_cols, f)
+    
+    # Prepare features and target
+    X = features[feature_cols]
+    y = features['target']
+    
+    # Scale features
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X)
+    joblib.dump(scaler, SCALER_FILE)
+    
+    return X_scaled, y.values, scaler, feature_cols, features['next_close']
+
+# -------------------------------
+# 2. Improved Model Architecture - Train Model
+# -------------------------------
+def train_model(use_csv=False, csv_file_path="historical_data.csv"):
+    """
+    Train the model using data loaded from yfinance (default) or from a CSV file.
+    
+    Parameters:
+        use_csv (bool): If True, load data from the CSV file specified by csv_file_path.
+                        Otherwise, data is loaded from yfinance.
+        csv_file_path (str): Path to the CSV file with historical data.
+    """
+    # Use a new filename for the ensemble model
+    model_path = os.path.join(model_dir, "ensemble_model_1m.model")
+    
+    if os.path.exists(model_path):
+        print("Loading existing ensemble model...")
+        model = joblib.load(model_path)
+        return model
+
+    print("Training new ensemble model...")
+    if use_csv:
+        df = load_data_csv(csv_file_path)
+    else:
+        df = load_data()
+        
+    # Preprocess the data (feature engineering, scaling, etc.)
+    X, y, scaler, feature_cols, next_closes = preprocess_data(df)
+
+    # Temporal split: use 80% of the data for training and 20% for testing
+    split = int(len(X) * 0.8)
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    # Balance classes with SMOTE
+    smote = SMOTE(sampling_strategy='minority')
+    X_train, y_train = smote.fit_resample(X_train, y_train)
+
+    # Build the ensemble stacking classifier
+    estimators = [
+        ('xgb', xgb.XGBClassifier(
+            max_depth=5, 
+            learning_rate=0.1, 
+            n_estimators=300,
+            use_label_encoder=False, 
+            eval_metric='logloss'
+        )),
+        ('lgbm', LGBMClassifier(
+            num_leaves=31, 
+            learning_rate=0.05, 
+            n_estimators=200
+        )),
+        ('logreg', LogisticRegression(
+            max_iter=1000, 
+            class_weight='balanced'
+        ))
+    ]
+
+    final_estimator = xgb.XGBClassifier(
+        max_depth=3, 
+        learning_rate=0.05, 
+        n_estimators=150,
+        use_label_encoder=False, 
+        eval_metric='logloss'
+    )
+
+    model = StackingClassifier(
+        estimators=estimators,
+        final_estimator=final_estimator,
+        stack_method='predict_proba',
+        passthrough=True
+    )
+
+    # Fit the ensemble model on the training data
+    model.fit(X_train, y_train)
+
+    # Optional: perform temporal cross-validation on the full dataset and print metrics
+    cv_results = temporal_cross_val(df, model)
+    print("Temporal Cross Validation Results:")
+    print(cv_results)
+
+    # Evaluate on the hold-out test set
+    preds = model.predict(X_test)
+    print("\n=== Ensemble Model Validation ===")
+    print(classification_report(y_test, preds))
+
+    # Save the trained model for future use
+    joblib.dump(model, model_path)
+    print(f"Ensemble model saved to {model_path}")
+    return model
+
+# -------------------------------
+# 3. Temporal Cross-Validation Function
+# -------------------------------
+def temporal_cross_val(df, model):
+    tscv = TimeSeriesSplit(n_splits=5, test_size=500)
+    metrics = []
+    
+    for train_idx, test_idx in tscv.split(df):
+        train = df.iloc[train_idx]
+        test = df.iloc[test_idx]
+        
+        # Feature engineering for train and test splits
+        X_train, y_train, _, _, _ = preprocess_data(train)
+        X_test, y_test, _, _, _ = preprocess_data(test)
+        
+        # Dynamic reweighting: give higher weights to more recent samples
+        sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
+        
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+        preds = model.predict(X_test)
+        
+        fold_metrics = {
+            'accuracy': accuracy_score(y_test, preds),
+            'precision': precision_score(y_test, preds, zero_division=0),
+            'recall': recall_score(y_test, preds, zero_division=0)
+        }
+        metrics.append(fold_metrics)
+    
+    return pd.DataFrame(metrics)
+
+# -------------------------------
+# Real-Time Forecast Function
+# -------------------------------
 def real_time_forecast():
     """Fetches live data and makes real-time predictions."""
     print("\nFetching latest market data...")
@@ -124,11 +330,9 @@ def real_time_forecast():
     last_timestamp = df.index[-1]
     timestamp = last_timestamp.strftime("%Y-%m-%d %I:%M:%S %p")
     
-    # Load trained model and scaler
-    model_path = os.path.join(model_dir, "xgboost_1m_one.model")
-    model = xgb.XGBClassifier()
-    model.load_model(model_path)
-
+    # Load trained ensemble model and scaler
+    model_path = os.path.join(model_dir, "ensemble_model_1m.model")
+    model = joblib.load(model_path)
     scaler = joblib.load(SCALER_FILE)
     with open(FEATURE_NAMES_FILE, 'r') as f:
         feature_names = json.load(f)
@@ -151,120 +355,76 @@ def real_time_forecast():
     last_high = df["high"].iloc[-1]
     last_low = df["low"].iloc[-1]
 
-    # Calculate price change using range and confidence
-    price_change = (last_high - last_low) * prob * (1 if predicted_direction else -1)
+    # Calculate dynamic volatility
+    if (last_high - last_low) == 0:
+        base_volatility = last_close * 0.0005  # fallback volatility
+    else:
+        base_volatility = (last_high - last_low) * 0.5
+
+    direction_multiplier = 1 if predicted_direction else -1
+    price_change = base_volatility * prob * direction_multiplier
     next_close = last_close + price_change
 
     print(f"{timestamp} | Predicted Direction: {'UP' if predicted_direction else 'DOWN'}, Confidence: {prob:.2%}")
     print(f"Last Close Price: {last_close:.2f}, Predicted Next Close: {next_close:.2f}")
 
-    # Save prediction to CSV file including the yfinance timestamp in 12-hour format
+    # Save prediction to CSV file
     data = {
         "Timestamp": [timestamp],
         "Last_Close": [last_close],
         "Predicted_Next_Close": [next_close],
         "Direction": ["UP" if predicted_direction else "DOWN"],
-        "Confidence": [prob]
+        "Confidence": [f"{prob * 100:.2f}%"]
     }
 
     df_log = pd.DataFrame(data)
-
     if not os.path.exists(CSV_FILE):
         df_log.to_csv(CSV_FILE, index=False, mode='w')
     else:
         df_log.to_csv(CSV_FILE, index=False, mode='a', header=False)
 
+    # Append the new prediction to the global list for live plotting
+    live_predictions.append({
+        "timestamp": last_timestamp,
+        "actual_close": last_close,
+        "forecast_close": next_close
+    })
+
+    # Update the live plot (saves to the shared volume directory)
+    update_live_plot(output_file="/plots/live_plot.png")
+
     return predicted_direction, prob, next_close
 
-def preprocess_data(df):
-    """Feature engineering pipeline"""
-    calculator = EnhancedFeatureCalculator()
-    features = calculator.calculate_core_features(df)
-    
-    # Save feature names
-    feature_cols = [col for col in features.columns if col not in ['target', 'next_close']]
-    with open(FEATURE_NAMES_FILE, 'w') as f:
-        json.dump(feature_cols, f)
-    
-    # Handle class imbalance
-    X = features[feature_cols]
-    y = features['target']
-    
-    # Scale features
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
-    joblib.dump(scaler, SCALER_FILE)
-    
-    return X_scaled, y.values, scaler, feature_cols, features['next_close']
+# -------------------------------
+# Live Plotting Function
+# -------------------------------
+def update_live_plot(output_file="/plots/live_plot.png"):
+    """Update a live Matplotlib plot of actual market close vs. forecast close prices."""
+    if not live_predictions:
+        return
 
-def optimize_model(X_train, y_train):
-    """Optimized classifier tuning"""
-    param_grid = {
-        'n_estimators': [200, 400],
-        'max_depth': [3, 5],
-        'learning_rate': [0.01, 0.1],
-        'subsample': [0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8]
-    }
+    df_plot = pd.DataFrame(live_predictions)
     
-    model = xgb.XGBClassifier(objective='binary:logistic', 
-                              eval_metric='logloss',
-                              use_label_encoder=False)
+    plt.figure("Live Forecast vs Actual", figsize=(10, 6))
+    plt.plot(df_plot['timestamp'], df_plot['actual_close'], label="Actual Close", marker="o")
+    plt.plot(df_plot['timestamp'], df_plot['forecast_close'], label="Forecast Close", marker="x")
     
-    tscv = TimeSeriesSplit(n_splits=VALIDATION_WINDOWS)
-    grid = GridSearchCV(model, param_grid, cv=tscv, scoring='accuracy', n_jobs=-1)
-    grid.fit(X_train, y_train)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.gcf().autofmt_xdate()
     
-    print(f"Best parameters: {grid.best_params_}")
-    return grid.best_estimator_
-
-def train_model():
-    """Enhanced training pipeline with model reuse"""
-    model_path = os.path.join(model_dir, "xgboost_1m_one.model")
+    plt.xlabel("Timestamp")
+    plt.ylabel("Price")
+    plt.title("Live Actual vs. Forecast Close Prices")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
     
-    if os.path.exists(model_path):
-        print("Loading existing model...")
-        model = xgb.XGBClassifier()
-        model.load_model(model_path)
-        return model
+    plt.savefig(output_file)
+    plt.close()
 
-    print("Training new model...")
-    df = load_data()
-    X, y, scaler, feature_cols, next_closes = preprocess_data(df)
-
-    # Temporal split
-    split = int(len(X) * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    # Balance classes
-    smote = SMOTE(sampling_strategy='minority')
-    X_train, y_train = smote.fit_resample(X_train, y_train)
-
-    model = optimize_model(X_train, y_train)
-    model.fit(X_train, y_train, 
-              eval_set=[(X_test, y_test)],
-              early_stopping_rounds=50,
-              verbose=True)
-
-    model.save_model(model_path)
-    validate_model(model, X_test, y_test)
-    return model
-
-def validate_model(model, X_test, y_test):
-    """Enhanced validation with feature analysis"""
-    preds = model.predict(X_test)
-    probs = model.predict_proba(X_test)[:, 1]
-    
-    print("\n=== Model Validation ===")
-    print(f"Accuracy: {accuracy_score(y_test, preds):.2%}")
-    print(classification_report(y_test, preds))
-    
-    importance = model.get_booster().get_score(importance_type='weight')
-    print("\nTop 10 Features:")
-    for feat, score in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]:
-        print(f"{feat}: {score}")
-
+# -------------------------------
+# Backtrader Strategy
+# -------------------------------
 class ForecastStrategy(bt.Strategy):
     """Optimized trading strategy with price forecasting"""
     params = (
@@ -276,8 +436,7 @@ class ForecastStrategy(bt.Strategy):
     )
     
     def __init__(self):
-        self.model = xgb.XGBClassifier()
-        self.model.load_model(os.path.join(model_dir, "xgboost_1m_one.model"))
+        self.model = joblib.load(os.path.join(model_dir, "ensemble_model_1m.model"))
         self.scaler = joblib.load(SCALER_FILE)
         with open(FEATURE_NAMES_FILE, 'r') as f:
             self.feature_names = json.load(f)
@@ -309,7 +468,7 @@ class ForecastStrategy(bt.Strategy):
             prob = self.model.predict_proba(scaled)[0][1]
             current_close = df_window.iloc[-1]['close']
             
-            # Store forecast details using the data timestamp
+            # Log forecast details
             if current_idx + 1 < len(self.data_df):
                 actual_next_close = self.data_df.iloc[current_idx + 1]['close']
                 forecast_entry = {
@@ -366,7 +525,6 @@ class ForecastStrategy(bt.Strategy):
             print("\n=== Advanced Forecasting Results ===")
             print(f"Total Predictions: {len(df_forecast)}")
             
-            # Direction metrics
             y_true = df_forecast['actual_direction']
             y_pred = df_forecast['predicted_direction']
             
@@ -377,32 +535,74 @@ class ForecastStrategy(bt.Strategy):
             print("\nConfusion Matrix:")
             print(confusion_matrix(y_true, y_pred))
             
-            # Price prediction metrics
-            df_forecast['predicted_close'] = df_forecast['current_close'] * \
-                (1 + df_forecast['predicted_prob'] * 0.0005)
+            df_forecast['predicted_close'] = df_forecast['current_close'] * (1 + df_forecast['predicted_prob'] * 0.0005)
             
-            mae = mean_absolute_error(df_forecast['actual_next_close'], 
-                                      df_forecast['predicted_close'])
+            mae = mean_absolute_error(df_forecast['actual_next_close'], df_forecast['predicted_close'])
+            rmse = np.sqrt(mean_squared_error(df_forecast['actual_next_close'], df_forecast['predicted_close']))
+            r2 = r2_score(df_forecast['actual_next_close'], df_forecast['predicted_close'])                          
             print(f"\nMean Absolute Error: {mae:.4f}")
+            print(f"RMSE: {rmse:.4f}")
+            print(f"R-squared: {r2:.4f}")
             
-            # Sample predictions
             print("\nSample Forecasts:")
             print(df_forecast[['timestamp', 'current_close', 'predicted_prob', 
                              'predicted_close', 'actual_next_close']].tail(5))
             
-            # Visualization
-            plt.figure(figsize=(12, 6))
+            plt.figure(figsize=(15, 10))
+            
+            plt.subplot(3, 1, 1)
             plt.plot(df_forecast['timestamp'], df_forecast['current_close'], label='Current Close')
             plt.plot(df_forecast['timestamp'], df_forecast['predicted_close'], 
                      label='Predicted Close', alpha=0.7)
             plt.plot(df_forecast['timestamp'], df_forecast['actual_next_close'], 
                      label='Actual Next Close', linestyle='--')
             plt.title('Price Forecast Performance')
-            plt.xlabel('Time')
-            plt.ylabel('Price')
             plt.legend()
+
+            plt.subplot(3, 1, 2)
+            calculator = EnhancedFeatureCalculator()
+            full_features = calculator.calculate_core_features(self.data_df.set_index('timestamp').ffill())
+            full_features.reset_index(inplace=True)
+            merged = pd.merge(df_forecast, full_features, on='timestamp', how='left')
+            plt.plot(merged['timestamp'], merged['1m_RSI'], label='RSI')
+            plt.axhline(70, linestyle='--', color='r', alpha=0.5)
+            plt.axhline(30, linestyle='--', color='g', alpha=0.5)
+            plt.title('RSI Indicator')
+            plt.legend()
+
+            plt.subplot(3, 1, 3)
+            plt.plot(merged['timestamp'], merged['1m_Keltner_Width'], label='Keltner Width')
+            plt.title('Keltner Channel Width')
+            plt.legend()
+
+            plt.tight_layout()
             plt.show()
 
+            plt.figure(figsize=(15, 5))
+            
+            plt.subplot(1, 2, 1)
+            residuals = df_forecast['actual_next_close'] - df_forecast['predicted_close']
+            plt.scatter(df_forecast['predicted_close'], residuals, alpha=0.5)
+            plt.axhline(0, color='r', linestyle='--')
+            plt.xlabel('Predicted Close')
+            plt.ylabel('Residuals')
+            plt.title('Prediction Residuals')
+
+            plt.subplot(1, 2, 2)
+            plt.scatter(df_forecast['actual_next_close'], df_forecast['predicted_close'], alpha=0.5)
+            plt.plot([df_forecast['actual_next_close'].min(), df_forecast['actual_next_close'].max()],
+                     [df_forecast['actual_next_close'].min(), df_forecast['actual_next_close'].max()], 
+                     'r--')
+            plt.xlabel('Actual Close')
+            plt.ylabel('Predicted Close')
+            plt.title('Actual vs Predicted Close')
+
+            plt.tight_layout()
+            plt.show()
+
+# -------------------------------
+# Backtest Runner
+# -------------------------------
 def run_backtest():
     """Optimized backtesting engine with enhanced reporting"""
     cerebro = bt.Cerebro(optreturn=False)
@@ -426,7 +626,6 @@ def run_backtest():
     results = cerebro.run()
     strat = results[0]
     
-    # Performance report
     print("\n=== Trading Performance ===")
     print(f"Ending Portfolio Value: {cerebro.broker.getvalue():.2f}")
 
@@ -448,15 +647,23 @@ def run_backtest():
 
     cerebro.plot(style='candlestick')
 
+# -------------------------------
+# Main Execution Block
+# -------------------------------
 if __name__ == "__main__":
-    # Optionally, train the model if not already trained
-    train_model()
+    # Train or load the ensemble model.
+    model = train_model(use_csv=False, csv_file_path="./data/NIFTY_BANK_1m.csv")
     
-    # Start real-time forecasting every minute (if desired)
-    schedule.every(1).minutes.do(real_time_forecast)
-    
-    # You can run the backtest separately if needed:
+    # Optionally, run temporal cross-validation separately.
+    df = load_data()  # Or load_data_csv(...) if preferred.
+
+    # cv_results = temporal_cross_val(df, model)
+    # print("Temporal Cross Validation Results:")
+    # print(cv_results)
     # run_backtest()
+    
+    # Schedule the real-time forecasting job to run every minute.
+    schedule.every(1).minutes.do(real_time_forecast)
     
     print("Starting scheduled real-time forecasting. Press Ctrl+C to exit.")
     try:
