@@ -156,7 +156,7 @@ def load_data_csv(csv_file_path):
     df.columns = [col.lower() for col in df.columns]
     return df.ffill().dropna()
 
-def load_live_data(symbol="^NSEBANK", interval="1m", period="1d"):
+def load_live_data(symbol="^NSEBANK", interval="1m", period="8d"):
     """Fetch real-time 1-minute price data from Yahoo Finance."""
     df = yf.download(tickers=symbol, interval=interval, period=period)
     df.reset_index(inplace=True)
